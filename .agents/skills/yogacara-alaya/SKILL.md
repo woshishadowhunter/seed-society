@@ -94,6 +94,24 @@ python -m seed_society consolidate GOAL --db society.db --mneme-dir ~/.dsh/memor
 注入；语义知识行不衰减（语义记忆稳定、情景记忆才衰减）。双向默认干跑，
 `--push`/`--apply` 才落盘并写 `memory.mneme_*` 审计事件。
 
+### 3d. 种子修订史与回滚（revision）
+
+种子变更不再就地覆盖不可撤销：每次 knowledge/experience 变更都追加一条
+修订（含 before/after 两侧 payload、operator、reason），历史只增不改。
+
+```bash
+python -m seed_society revision list --db society.db            # 修订史（最早在前）
+python -m seed_society revision list --kind experience --seed-id EXP_ID
+python -m seed_society revision show REVISION_ID --db society.db
+python -m seed_society revision rollback REVISION_ID --by operator --reason "why"
+```
+
+回滚是**确定性逆编辑**（不让模型猜旧状态），必须显式给操作员身份。自动路径
+也留有意义的 operator：`promotion`（晋升门产出）、`consolidate`（重放刷新）、
+`decay`（遗忘衰减）。撤销本身也记录在案，所以可以撤销撤销。范围仅限
+knowledge/experience——goal/task/artifact/review/attempt/event 是审计记录，
+不可改写。
+
 ### 4. 种子相续（genome recombine）
 
 ```bash
