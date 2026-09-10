@@ -18,3 +18,7 @@ dist/
 # 隐私：记忆库审计报告（含记忆元数据），仅存本机
 integrations/dsh/maintenance/
 
+
+# 探针抓包（含真实请求元数据），仅存本机
+integrations/dsh/probe/*.jsonl
+
