@@ -43,6 +43,9 @@ from .domain import (
     PublicationStatus,
     RemoteAgentRegistration,
     Review,
+    RevisionAction,
+    SeedKind,
+    SeedRevision,
     Task,
     TaskStatus,
     SpanStatus,
@@ -161,6 +164,25 @@ class SQLiteRepository:
                 knowledge_id TEXT PRIMARY KEY,
                 payload TEXT NOT NULL
             );
+            -- Append-only seed history: one row per knowledge/experience
+            -- mutation, carrying both sides of the change. A rollback writes
+            -- the inverse into the live table and records its own revision;
+            -- history rows are never updated or deleted, so an undo is always
+            -- itself auditable and can be undone again.
+            CREATE TABLE IF NOT EXISTS seed_revisions (
+                revision_id TEXT PRIMARY KEY,
+                seed_kind TEXT NOT NULL,
+                seed_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                before_payload TEXT,
+                after_payload TEXT,
+                operator TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                rolled_back_revision_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS seed_revisions_seed_idx
+                ON seed_revisions(seed_kind, seed_id, created_at);
             CREATE TABLE IF NOT EXISTS approvals (
                 approval_id TEXT PRIMARY KEY,
                 fingerprint TEXT UNIQUE NOT NULL,
@@ -1679,8 +1701,17 @@ class SQLiteRepository:
         return ExperienceRecord(**data)
 
     def save_experience(
-        self, experience: ExperienceRecord, *, overwrite: bool = False
+        self,
+        experience: ExperienceRecord,
+        *,
+        overwrite: bool = False,
+        operator: str = "local",
+        reason: str = "",
     ) -> None:
+        # Read the prior state BEFORE writing so the revision records what
+        # actually changed. A non-overwrite insert that conflicts changes
+        # nothing, so it must not append a revision claiming a change.
+        previous = self.get_experience(experience.experience_id)
         if overwrite:
             self.connection.execute(
                 "INSERT INTO experience_records("
@@ -1697,8 +1728,9 @@ class SQLiteRepository:
                     _dump(asdict(experience)),
                 ),
             )
+            mutated = True
         else:
-            self.connection.execute(
+            cursor = self.connection.execute(
                 "INSERT INTO experience_records("
                 "experience_id, agent_id, task_type, goal_id, payload"
                 ") VALUES (?, ?, ?, ?, ?) "
@@ -1711,6 +1743,30 @@ class SQLiteRepository:
                     _dump(asdict(experience)),
                 ),
             )
+            mutated = cursor.rowcount > 0
+        if mutated:
+            self._append_seed_revision(
+                SeedKind.EXPERIENCE,
+                experience.experience_id,
+                RevisionAction.UPDATE if previous is not None else RevisionAction.CREATE,
+                operator=operator,
+                before_payload=asdict(previous) if previous is not None else None,
+                after_payload=asdict(experience),
+                reason=reason,
+            )
+        self.connection.commit()
+
+    def get_experience(self, experience_id: str) -> ExperienceRecord | None:
+        row = self.connection.execute(
+            "SELECT payload FROM experience_records WHERE experience_id=?",
+            (experience_id,),
+        ).fetchone()
+        return None if row is None else self._experience_from_payload(row["payload"])
+
+    def delete_experience(self, experience_id: str) -> None:
+        self.connection.execute(
+            "DELETE FROM experience_records WHERE experience_id=?", (experience_id,)
+        )
         self.connection.commit()
 
     def list_experience(
@@ -1755,12 +1811,40 @@ class SQLiteRepository:
         rows = self.connection.execute(query, parameters).fetchall()
         return [self._experience_from_payload(row["payload"]) for row in rows]
 
-    def save_knowledge(self, item: KnowledgeItem) -> None:
-        self.connection.execute(
-            "INSERT INTO knowledge(knowledge_id, payload) VALUES (?, ?)",
-            (item.knowledge_id, _dump(asdict(item))),
-        )
-        self.connection.commit()
+    def save_knowledge(
+        self,
+        item: KnowledgeItem,
+        *,
+        operator: str = "local",
+        reason: str = "",
+    ) -> None:
+        """Write a knowledge seed and append its revision atomically."""
+        previous = self.get_knowledge(item.knowledge_id)
+        with self._immediate_transaction():
+            self.connection.execute(
+                "INSERT INTO knowledge(knowledge_id, payload) VALUES (?, ?) "
+                "ON CONFLICT(knowledge_id) DO UPDATE SET payload=excluded.payload",
+                (item.knowledge_id, _dump(asdict(item))),
+            )
+            self._append_seed_revision(
+                SeedKind.KNOWLEDGE,
+                item.knowledge_id,
+                RevisionAction.UPDATE if previous is not None else RevisionAction.CREATE,
+                operator=operator,
+                before_payload=asdict(previous) if previous is not None else None,
+                after_payload=asdict(item),
+                reason=reason,
+            )
+
+    def get_knowledge(self, knowledge_id: str) -> KnowledgeItem | None:
+        row = self.connection.execute(
+            "SELECT payload FROM knowledge WHERE knowledge_id=?", (knowledge_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        data = _load(row["payload"])
+        data["tags"] = tuple(data["tags"])
+        return KnowledgeItem(**data)
 
     def list_knowledge(self) -> list[KnowledgeItem]:
         rows = self.connection.execute(
@@ -1772,6 +1856,127 @@ class SQLiteRepository:
             data["tags"] = tuple(data["tags"])
             result.append(KnowledgeItem(**data))
         return result
+
+    def delete_knowledge(self, knowledge_id: str) -> None:
+        self.connection.execute(
+            "DELETE FROM knowledge WHERE knowledge_id=?", (knowledge_id,)
+        )
+        self.connection.commit()
+
+    def _append_seed_revision(
+        self,
+        seed_kind: SeedKind,
+        seed_id: str,
+        action: RevisionAction,
+        *,
+        operator: str,
+        before_payload: dict[str, Any] | None,
+        after_payload: dict[str, Any] | None,
+        reason: str = "",
+        rolled_back_revision_id: str = "",
+    ) -> SeedRevision:
+        revision = SeedRevision.create(
+            seed_kind,
+            seed_id,
+            action,
+            operator=operator,
+            before_payload=before_payload,
+            after_payload=after_payload,
+            reason=reason,
+            rolled_back_revision_id=rolled_back_revision_id,
+        )
+        self.connection.execute(
+            "INSERT INTO seed_revisions("
+            "revision_id, seed_kind, seed_id, action, before_payload, "
+            "after_payload, operator, reason, rolled_back_revision_id, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                revision.revision_id,
+                revision.seed_kind.value,
+                revision.seed_id,
+                revision.action.value,
+                _dump(revision.before_payload) if revision.before_payload else None,
+                _dump(revision.after_payload) if revision.after_payload else None,
+                revision.operator,
+                revision.reason,
+                revision.rolled_back_revision_id,
+                revision.created_at,
+            ),
+        )
+        return revision
+
+    def record_seed_revision(
+        self, revision: SeedRevision
+    ) -> SeedRevision:
+        """Append an already-built revision (used by rollback)."""
+        with self._immediate_transaction():
+            self.connection.execute(
+                "INSERT INTO seed_revisions("
+                "revision_id, seed_kind, seed_id, action, before_payload, "
+                "after_payload, operator, reason, rolled_back_revision_id, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    revision.revision_id,
+                    revision.seed_kind.value,
+                    revision.seed_id,
+                    revision.action.value,
+                    _dump(revision.before_payload) if revision.before_payload else None,
+                    _dump(revision.after_payload) if revision.after_payload else None,
+                    revision.operator,
+                    revision.reason,
+                    revision.rolled_back_revision_id,
+                    revision.created_at,
+                ),
+            )
+        return revision
+
+    @staticmethod
+    def _revision_from_row(row: Any) -> SeedRevision:
+        return SeedRevision(
+            revision_id=row["revision_id"],
+            seed_kind=SeedKind(row["seed_kind"]),
+            seed_id=row["seed_id"],
+            action=RevisionAction(row["action"]),
+            operator=row["operator"],
+            before_payload=_load(row["before_payload"]) if row["before_payload"] else None,
+            after_payload=_load(row["after_payload"]) if row["after_payload"] else None,
+            reason=row["reason"] or "",
+            rolled_back_revision_id=row["rolled_back_revision_id"] or "",
+            created_at=row["created_at"],
+        )
+
+    def list_seed_revisions(
+        self,
+        *,
+        seed_kind: SeedKind | None = None,
+        seed_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[SeedRevision]:
+        query = "SELECT * FROM seed_revisions"
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if seed_kind is not None:
+            clauses.append("seed_kind=?")
+            parameters.append(SeedKind(seed_kind).value)
+        if seed_id is not None:
+            clauses.append("seed_id=?")
+            parameters.append(str(seed_id))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, rowid"
+        if limit is not None:
+            if not 1 <= limit <= 10_000:
+                raise ValueError("revision list limit must be between 1 and 10000")
+            query += " LIMIT ?"
+            parameters.append(limit)
+        rows = self.connection.execute(query, parameters).fetchall()
+        return [self._revision_from_row(row) for row in rows]
+
+    def get_seed_revision(self, revision_id: str) -> SeedRevision | None:
+        row = self.connection.execute(
+            "SELECT * FROM seed_revisions WHERE revision_id=?", (revision_id,)
+        ).fetchone()
+        return None if row is None else self._revision_from_row(row)
 
     def save_approval(self, approval: ApprovalRequest) -> None:
         with self._immediate_transaction():

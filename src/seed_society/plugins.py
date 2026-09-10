@@ -88,6 +88,14 @@ SOCIETY_MANIFESTS: tuple[PluginManifest, ...] = (
         depends_on=("seed-store", "seed-experience"),
     ),
     PluginManifest(
+        "seed-revisions",
+        Consciousness.ALAYA,
+        "可审计种子修订史与确定性回滚（逆编辑重建，含必须失败反例）",
+        "seed_society.revisions",
+        ("SeedRollback", "RollbackReport"),
+        depends_on=("seed-store",),
+    ),
+    PluginManifest(
         "seed-evolution",
         Consciousness.ALAYA,
         "种子相续：双亲基因组确定性重组出子代候选",

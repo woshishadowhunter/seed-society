@@ -222,7 +222,9 @@ class ConsolidationEngine:
             # Reconsolidation: refresh dynamics of replayed records first, so
             # the store reflects the consolidated salience/strength values.
             for record in replayed_records:
-                self.repository.save_experience(record, overwrite=True)
+                self.repository.save_experience(
+                    record, overwrite=True, operator="consolidate", reason=goal_id
+                )
             promotion_candidates = self._promotion_candidates(replayed_records)
             promotions_applied = self._apply_promotions(promotion_candidates)
             decayed, dormant = self._apply_decay(now)
@@ -346,7 +348,9 @@ class ConsolidationEngine:
                     candidate["title"],
                     candidate["content"],
                     candidate["tags"],
-                )
+                ),
+                operator="promotion",
+                reason=",".join(candidate["corroborated_goals"]),
             )
             applied += 1
         return applied
@@ -370,7 +374,9 @@ class ConsolidationEngine:
             if updated.strength < EXPERIENCE_DORMANT_THRESHOLD:
                 dormant += 1
             if updated.strength != record.strength:
-                self.repository.save_experience(updated, overwrite=True)
+                self.repository.save_experience(
+                    updated, overwrite=True, operator="decay"
+                )
                 decayed += 1
         return decayed, dormant
 

@@ -45,6 +45,7 @@ from .domain import (
     PolicyActivation,
     PolicyVerdict,
     RunBudget,
+    SeedKind,
     Task,
     utc_now,
 )
@@ -880,6 +881,39 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--limit", type=int, default=5)
     search.add_argument("--db", default="seed-society.db")
     search.add_argument("--json", action="store_true")
+
+    revision = commands.add_parser(
+        "revision", help="inspect seed revision history and roll changes back"
+    )
+    revision_commands = revision.add_subparsers(
+        dest="revision_command", required=True
+    )
+    revision_list = revision_commands.add_parser(
+        "list", help="list recorded seed revisions (oldest first)"
+    )
+    revision_list.add_argument(
+        "--kind", choices=[kind.value for kind in SeedKind]
+    )
+    revision_list.add_argument("--seed-id")
+    revision_list.add_argument("--limit", type=int, default=50)
+    revision_list.add_argument("--db", default="seed-society.db")
+    revision_list.add_argument("--json", action="store_true")
+    revision_show = revision_commands.add_parser(
+        "show", help="inspect one revision including both payload sides"
+    )
+    revision_show.add_argument("revision_id")
+    revision_show.add_argument("--db", default="seed-society.db")
+    revision_show.add_argument("--json", action="store_true")
+    revision_rollback = revision_commands.add_parser(
+        "rollback", help="undo a revision by writing its inverse back"
+    )
+    revision_rollback.add_argument("revision_id")
+    revision_rollback.add_argument(
+        "--by", required=True, help="operator identity (never inferred)"
+    )
+    revision_rollback.add_argument("--reason", default="")
+    revision_rollback.add_argument("--db", default="seed-society.db")
+    revision_rollback.add_argument("--json", action="store_true")
 
     genome = commands.add_parser("genome", help="manage auditable agent seed genomes")
     genome_commands = genome.add_subparsers(dest="genome_command", required=True)
@@ -1803,6 +1837,47 @@ def main(argv: Sequence[str] | None = None) -> int:
                 limit=args.limit,
             )
             _emit(value, args.json, f"{len(value)} experience records")
+            return 0
+
+        if args.command == "revision":
+            if not hasattr(repository, "list_seed_revisions"):
+                raise RuntimeError("seed revisions require the SQLite path")
+            from .revisions import SeedRollback
+
+            if args.revision_command == "list":
+                value = repository.list_seed_revisions(
+                    seed_kind=SeedKind(args.kind) if args.kind else None,
+                    seed_id=args.seed_id,
+                    limit=args.limit,
+                )
+                _emit(value, args.json, f"{len(value)} seed revisions")
+                return 0
+            if args.revision_command == "show":
+                value = repository.get_seed_revision(args.revision_id)
+                if value is None:
+                    raise KeyError(f"revision not found: {args.revision_id}")
+                _emit(
+                    value,
+                    args.json,
+                    (
+                        f"{value.revision_id}: {value.action.value} "
+                        f"{value.seed_kind.value}/{value.seed_id} by {value.operator}"
+                    ),
+                )
+                return 0
+            value = SeedRollback(repository).rollback(
+                args.revision_id,
+                operator=args.by,
+                reason=args.reason,
+            )
+            _emit(
+                value,
+                args.json,
+                (
+                    f"Rolled back {value.revision_id} ({value.seed_kind.value}/"
+                    f"{value.seed_id}): {value.detail}"
+                ),
+            )
             return 0
 
         memory = MemoryManager(repository)

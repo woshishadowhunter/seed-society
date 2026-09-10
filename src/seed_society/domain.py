@@ -1610,6 +1610,92 @@ class DeploymentRecord:
     created_at: str = field(default_factory=utc_now)
 
 
+class SeedKind(str, Enum):
+    """Seed collections that carry revision history and can be rolled back."""
+
+    KNOWLEDGE = "knowledge"
+    EXPERIENCE = "experience"
+
+
+class RevisionAction(str, Enum):
+    CREATE = "create"
+    UPDATE = "update"
+    ROLLBACK = "rollback"
+
+
+@dataclass(frozen=True, slots=True)
+class SeedRevision:
+    """One auditable knowledge/experience mutation, carrying both sides.
+
+    History is append-only: a rollback writes the inverse into the live table
+    and appends its own revision, so an undo never destroys evidence and is
+    itself reversible.
+    """
+
+    revision_id: str
+    seed_kind: SeedKind
+    seed_id: str
+    action: RevisionAction
+    operator: str
+    before_payload: dict[str, Any] | None = None
+    after_payload: dict[str, Any] | None = None
+    reason: str = ""
+    rolled_back_revision_id: str = ""
+    created_at: str = field(default_factory=utc_now)
+
+    @classmethod
+    def create(
+        cls,
+        seed_kind: SeedKind,
+        seed_id: str,
+        action: RevisionAction,
+        *,
+        operator: str,
+        before_payload: dict[str, Any] | None = None,
+        after_payload: dict[str, Any] | None = None,
+        reason: str = "",
+        rolled_back_revision_id: str = "",
+    ) -> SeedRevision:
+        normalized_operator = str(operator).strip()
+        if not normalized_operator:
+            raise ValueError("revision operator must not be empty")
+        normalized_id = str(seed_id).strip()
+        if not normalized_id:
+            raise ValueError("revision seed id must not be empty")
+        kind = SeedKind(seed_kind)
+        act = RevisionAction(action)
+        if act == RevisionAction.CREATE and before_payload is not None:
+            raise ValueError("a create revision cannot carry a previous payload")
+        if act == RevisionAction.UPDATE and before_payload is None:
+            raise ValueError("an update revision requires the previous payload")
+        if act == RevisionAction.ROLLBACK and not rolled_back_revision_id.strip():
+            raise ValueError("a rollback revision must name the revision it undoes")
+        if before_payload is not None and not isinstance(before_payload, dict):
+            raise ValueError("revision payloads must be objects")
+        if after_payload is not None and not isinstance(after_payload, dict):
+            raise ValueError("revision payloads must be objects")
+        return cls(
+            revision_id=f"revision-{uuid4().hex[:16]}",
+            seed_kind=kind,
+            seed_id=normalized_id,
+            action=act,
+            operator=normalized_operator,
+            before_payload=dict(before_payload) if before_payload else None,
+            after_payload=dict(after_payload) if after_payload else None,
+            reason=" ".join(str(reason).split()).strip()[:256],
+            rolled_back_revision_id=str(rolled_back_revision_id).strip(),
+        )
+
+    def inverse_payload(self) -> dict[str, Any] | None:
+        """The payload that restores the state before this revision ran."""
+        return self.before_payload
+
+    def is_reversible(self) -> bool:
+        """A rollback revision is not itself re-rolled; undo it by re-applying
+        the revision it reversed."""
+        return self.action in {RevisionAction.CREATE, RevisionAction.UPDATE}
+
+
 @dataclass(frozen=True, slots=True)
 class SelectionDecision:
     agent_id: str

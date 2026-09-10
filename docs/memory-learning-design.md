@@ -134,3 +134,36 @@ seed-society consolidate GOAL --db society.db --mneme-dir ~/.dsh/memory --apply 
 - 戒律：双向均默认干跑，`--push`/`--apply` 才落盘并写 `memory.mneme_*`
   审计事件；mneme 的 LLM 巩固（autoDream）与其 CAS 审计保持原样，我们的
   确定性晋升门与之互补——LLM 做模糊仲裁，确定性规则做晋升门槛。
+
+## 九、种子修订史与回滚（2026-09）
+
+此前种子是**就地覆盖**：`save_knowledge` / `save_experience` 直接覆写 payload，
+晋升与衰减都不可撤销。本节补上"可撤销"这一环。
+
+**机制**（`seed_revisions` 表 + `revisions.py`，零依赖纯确定性）：
+
+- **追加式历史**：每次 knowledge/experience 变更写一行 revision，同时携带
+  `before` / `after` 两侧 payload 与 `operator` / `reason`。历史行**永不修改或
+  删除**，所以撤销本身也可审计、可再撤销；
+- **确定性逆编辑**：回滚把 `before` 写回实体表，不询问任何模型去"猜"旧状态
+  （该纪律取自经源码审计的 `dsh-continual-evolve`，非照抄其文件快照方案）；
+- **回滚可逆**：若实体已等于 `before`（说明该次修订已被撤销过），回滚改为
+  取 `after`，即"撤销的撤销"恢复较新状态，而不是重复自己；
+- **不记录幻影变更**：非覆盖写命中已存在行时是 no-op，不追加 revision；
+- **范围限定**：只管 knowledge 与 experience。goal/task/artifact/review/
+  attempt/event 是审计记录，改写它们会破坏"审计线索只增不改"的不变量。
+
+**操作**：
+
+```bash
+seed-society revision list [--kind knowledge|experience] [--seed-id ID]
+seed-society revision show REVISION_ID
+seed-society revision rollback REVISION_ID --by OPERATOR [--reason TEXT]
+```
+
+回滚必须给操作员身份，绝不推断。自动路径也留下有意义的 operator：
+`promotion`（晋升门产出）、`consolidate`（重放刷新）、`decay`（遗忘衰减）。
+
+**测试含"必须失败"反例**（`tests/test_revisions.py`，16 项）：未知修订、回滚
+一个回滚、空操作员、create 带 before、update 缺 before、rollback 缺目标修订
+——全部必须被拒绝，而不是静默成功。
