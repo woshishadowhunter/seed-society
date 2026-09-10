@@ -37,6 +37,7 @@ from .domain import (
     Verdict,
 )
 from .experience import lessons_for_review, tags_for_review
+from .predicates import is_stale, retrieval_count, screen_duplicate, secret_reason
 from .scheduler import parse_utc
 from .storage import SQLiteRepository
 
@@ -93,6 +94,7 @@ class ConsolidationReport:
     experiences_new: int
     decayed_records: int
     dormant_records: int
+    stale_seeds: tuple[dict[str, Any], ...]
     promotion_candidates: tuple[dict[str, Any], ...]
     promotions_applied: int
     self_model_suggestions: tuple[dict[str, Any], ...]
@@ -252,6 +254,7 @@ class ConsolidationEngine:
             experiences_new=new_records,
             decayed_records=decayed,
             dormant_records=dormant,
+            stale_seeds=tuple(self._stale_seeds(now)),
             promotion_candidates=tuple(promotion_candidates),
             promotions_applied=promotions_applied,
             self_model_suggestions=tuple(self_model_suggestions),
@@ -309,6 +312,7 @@ class ConsolidationEngine:
             group["max_strength"] = max(group["max_strength"], strength)
 
         existing_knowledge = self.repository.list_knowledge()
+        existing_pairs = [(item.title, item.content) for item in existing_knowledge]
         candidates: list[dict[str, Any]] = []
         for key in sorted(groups):
             group = groups[key]
@@ -318,24 +322,31 @@ class ConsolidationEngine:
                 continue
             title = f"{group['task_type']} 成功模式"
             content = str(group["lesson"])
-            if any(
-                _overlap(f"{item.title} {item.content}", f"{title} {content}")
-                >= policy.promotion_overlap_limit
-                for item in existing_knowledge
-            ):
+            # Hard block on a near-duplicate (adding it teaches nothing; the
+            # caller should update the existing seed instead). A merely similar
+            # seed is allowed through but flagged so the similarity is visible
+            # rather than silent.
+            verdict = screen_duplicate(title, content, existing_pairs)
+            if verdict.blocked:
                 continue
-            candidates.append(
-                {
-                    "title": title,
-                    "content": content,
-                    "tags": sorted(
-                        {group["task_type"], "pattern:success", "source:consolidation"}
-                    ),
-                    "corroborated_goals": sorted(group["goals"]),
-                    "agents": sorted(group["agents"]),
-                    "max_strength": round(group["max_strength"], 6),
-                }
-            )
+            blocked_by_secret = secret_reason(f"{title} {content}")
+            if blocked_by_secret:
+                continue
+            candidate: dict[str, Any] = {
+                "title": title,
+                "content": content,
+                "tags": sorted(
+                    {group["task_type"], "pattern:success", "source:consolidation"}
+                ),
+                "corroborated_goals": sorted(group["goals"]),
+                "agents": sorted(group["agents"]),
+                "max_strength": round(group["max_strength"], 6),
+            }
+            if verdict.warned:
+                candidate["similar_to"] = verdict.matched_title
+                candidate["similarity"] = round(verdict.score, 4)
+            candidates.append(candidate)
+            existing_pairs.append((title, content))
             if len(candidates) >= policy.promotion_max_items:
                 break
         return candidates
@@ -386,6 +397,35 @@ class ConsolidationEngine:
             for record in self.repository.list_experience()
             if record.strength < EXPERIENCE_DORMANT_THRESHOLD
         )
+
+    def _stale_seeds(self, now: str) -> list[dict[str, Any]]:
+        """Seeds that are old AND never retrieved (advisory report only).
+
+        Age alone is not evidence of uselessness, so this is reported rather
+        than acted on: a seed that keeps being injected has earned its place
+        however old it is. Decay still runs on its own strength signal.
+        """
+        stale: list[dict[str, Any]] = []
+        for record in self.repository.list_experience():
+            anchor = record.last_activated_at or record.created_at
+            try:
+                age = (parse_utc(now) - parse_utc(anchor)).total_seconds()
+            except ValueError:
+                continue
+            used = max(retrieval_count(record), record.activations)
+            if not is_stale(age_seconds=age, retrieval_count=used):
+                continue
+            stale.append(
+                {
+                    "experience_id": record.experience_id,
+                    "task_type": record.task_type,
+                    "age_days": round(age / 86_400.0, 1),
+                    "retrieval_count": used,
+                    "strength": round(record.strength, 4),
+                }
+            )
+        stale.sort(key=lambda item: -item["age_days"])
+        return stale
 
     def _self_model_suggestions(
         self, replayed: list[ExperienceRecord]

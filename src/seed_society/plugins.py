@@ -96,6 +96,14 @@ SOCIETY_MANIFESTS: tuple[PluginManifest, ...] = (
         depends_on=("seed-store",),
     ),
     PluginManifest(
+        "seed-predicates",
+        Consciousness.SILA,
+        "纯谓词筛查：近重复阻断/相似告警、不可配置凭据筛查、双信号陈旧",
+        "seed_society.predicates",
+        ("screen_duplicate", "secret_reason", "is_stale"),
+        depends_on=("seed-store",),
+    ),
+    PluginManifest(
         "seed-evolution",
         Consciousness.ALAYA,
         "种子相续：双亲基因组确定性重组出子代候选",

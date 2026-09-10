@@ -167,3 +167,30 @@ seed-society revision rollback REVISION_ID --by OPERATOR [--reason TEXT]
 **测试含"必须失败"反例**（`tests/test_revisions.py`，16 项）：未知修订、回滚
 一个回滚、空操作员、create 带 before、update 缺 before、rollback 缺目标修订
 ——全部必须被拒绝，而不是静默成功。
+
+## 十、纯谓词筛查（2026-09）
+
+`predicates.py`：确定性、无副作用、可直接单测，供任何写入方复用。
+
+**近重复阻断 / 相似告警**（0.8 / 0.5，Jaccard over token 集）：
+
+- 晋升门的判据从"单一阈值静默跳过"升级为两级：**≥0.8 硬阻断**（近重复不增加
+  信息，应当改为 update 既有种子），**≥0.5 放行但标记**（`similar_to` /
+  `similarity` 写入候选，让相似性可见而非静默）；
+- 分词对 CJK 做**字符级**补充（中文无词间空格，纯 ASCII 词元会让中文种子评分
+  恒为 0）。
+
+**凭据筛查不可配置**：8 条正则（OpenAI/GitHub/Slack/AWS/Google/PEM/JWT/
+带标签赋值）。刻意不提供配置项——用户正则笔误绝不能关掉凭据筛查。
+
+**双信号陈旧（仅报告，不自动处置）**：`is_stale` = 老 **且** 从未被检索。
+年龄本身不是无用证据（持续被注入的种子无论多老都挣得了位置），所以陈旧只进
+`ConsolidationReport.stale_seeds` 供人判断，衰减仍按自身 strength 信号运行。
+
+**测试**（`tests/test_predicates.py`，24 项）覆盖：完全/部分/无重叠、CJK 不断
+裂、空语料、五类真实凭据样例、普通散文不误报、仅出现"secret"一词不误报、
+边界值、布尔不得当计数。
+
+**未实施**：原计划的"原子写 + 读取 normalize"**已放弃**——审计后确认本项目
+种子只存 SQLite、**没有任何手工可编辑的种子文件面**，该模式无适用对象；不为
+凑齐清单而发明一个文件层。
